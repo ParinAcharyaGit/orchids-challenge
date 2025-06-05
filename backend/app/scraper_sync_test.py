@@ -1,4 +1,5 @@
 # backend/app/scraper_sync.py
+# this is the latest working version that returned html website but with insufficent styling.
 
 import re
 import httpx

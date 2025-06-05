@@ -1,32 +1,18 @@
-# backend/app/scraper_sync.py
+# backend/app/scraper_async.py
 
 import re
 import httpx
 from bs4 import BeautifulSoup
-from playwright.sync_api import sync_playwright
+from playwright.async_api import async_playwright
 from fastapi import HTTPException
-from urllib.parse import urlparse, urljoin
+from urllib.parse import urlparse
+import json
 
 from utils import to_data_uri, resolve_url
 
 PLAYWRIGHT_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
 )
-
-def resolve_urls_in_html(html: str, base_url: str) -> str:
-    soup = BeautifulSoup(html, "html.parser")
-
-    # Tags with `src` or `href` to fix
-    tags_with_src = soup.find_all(src=True)
-    tags_with_href = soup.find_all(href=True)
-
-    for tag in tags_with_src:
-        tag['src'] = urljoin(base_url, tag['src'])
-
-    for tag in tags_with_href:
-        tag['href'] = urljoin(base_url, tag['href'])
-
-    return str(soup)
 
 def is_valid_url(url: str) -> bool:
     parsed = urlparse(url)
@@ -57,49 +43,46 @@ def extract_dom_structure(soup):
     
     return element_to_dict(soup)
 
-def fetch_with_playwright_sync(url: str, timeout: float = 30000) -> dict:
+async def fetch_with_playwright_async(url: str, timeout: float = 30000) -> dict:
     print(f"🚀 Starting Playwright scrape for: {url}")
 
     try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(
-                headless=True,
-                args=[
-                    '--no-sandbox',
-                    '--disable-setuid-sandbox',
-                    '--disable-dev-shm-usage',
-                    '--disable-web-security',
-                    '--disable-features=VizDisplayCompositor'
-                ]
-            )
-            context = browser.new_context(
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True, args=[
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage',
+                '--disable-web-security',
+                '--disable-features=VizDisplayCompositor'
+            ])
+            context = await browser.new_context(
                 user_agent=PLAYWRIGHT_USER_AGENT,
                 viewport={'width': 1920, 'height': 1080}
             )
-            page = context.new_page()
+            page = await context.new_page()
 
             # Route handler to block unnecessary resources
-            def route_handler(route, request):
+            async def route_handler(route, request):
                 if request.resource_type in ["image", "font", "media"]:
-                    route.abort()
+                    await route.abort()
                     return
 
                 if any(domain in request.url for domain in ["githubgithubassets.com", "analytics", "tracking"]):
-                    route.abort()
+                    await route.abort()
                     return
 
-                route.continue_()
+                await route.continue_()
 
-            page.route("**/*", route_handler)
+            await page.route("**/*", route_handler)
 
             print("📡 Navigating to URL...")
-            page.goto(url, wait_until="networkidle", timeout=timeout)
+            await page.goto(url, wait_until="networkidle", timeout=timeout)
 
             print("⏳ Waiting for dynamic content...")
-            page.wait_for_timeout(8000)
+            await page.wait_for_timeout(8000)
 
             print("📄 Extracting page content...")
-            full_html = page.content()
+            full_html = await page.content()
 
             soup = BeautifulSoup(full_html, 'html.parser')
             head_html = str(soup.find('head')) or ""
@@ -107,7 +90,7 @@ def fetch_with_playwright_sync(url: str, timeout: float = 30000) -> dict:
             body_html = str(body_element) if body_element else ""
 
             print("🎨 Extracting CSS...")
-            styles = page.eval_on_selector_all(
+            styles = await page.eval_on_selector_all(
                 "style, link[rel='stylesheet']",
                 """
                 async (elements) => {
@@ -131,8 +114,8 @@ def fetch_with_playwright_sync(url: str, timeout: float = 30000) -> dict:
             )
             critical_css = "\n".join(styles)
 
-            context.close()
-            browser.close()
+            await context.close()
+            await browser.close()
 
             return {
                 "head": head_html,
@@ -147,8 +130,8 @@ def fetch_with_playwright_sync(url: str, timeout: float = 30000) -> dict:
             }
 
     except Exception as e:
-        print(f"❌ Playwright Sync Error: {e}")
-        raise HTTPException(status_code=400, detail=f"Playwright Sync Error: {e}")
+        print(f"❌ Playwright Async Error: {e}")
+        raise HTTPException(status_code=400, detail=f"Playwright Async Error: {e}")
 
 def inline_images_sync(html: str, base_url: str) -> str:
     """
@@ -183,19 +166,14 @@ def inline_images_sync(html: str, base_url: str) -> str:
     print("🖼️  Image inlining completed!")
     return str(soup)
 
-def fetch_design_context_sync(url: str) -> dict:
+async def fetch_design_context_async(url: str) -> dict:
     if not is_valid_url(url):
         raise HTTPException(status_code=400, detail=f"Invalid URL: {url}")
-
-    data = fetch_with_playwright_sync(url)
-
-    # Ensure all relative URLs in <head> and <body> are made absolute
-    resolved_head = resolve_urls_in_html(data["head"], url)
-    resolved_body = resolve_urls_in_html(data["body"], url)
-
+    
+    data = await fetch_with_playwright_async(url)
     return {
-        "head": resolved_head,
-        "body": resolved_body,
+        "head": data["head"],
+        "body": data["body"],
         "css": data["critical_css"],
         "debug_info": data["debug_info"],
         "url": url

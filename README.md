@@ -19,7 +19,18 @@ uv sync
 To run the backend development server, use the following command:
 
 ```bash
-uv run fastapi dev
+cd backend
+py -3.11 -m venv venv311
+source .\.venv311\Scripts\Activate
+pip install -r requirements.txt
+playwright install chromium
+```
+
+Then input:
+```bash
+
+cd app
+uvicorn main:app --reload
 ```
 
 ## Frontend
@@ -31,6 +42,7 @@ The frontend is built with Next.js and TypeScript.
 To install the frontend dependencies, navigate to the frontend project directory and run:
 
 ```bash
+cd frontend
 npm install
 ```
 

@@ -1,128 +1,226 @@
-# LLM + prompt template for the website cloner
-# using Llama 2 via HF Inference API
+# backend/app/llm_client.py
+# LLM + prompt template for the website cloner with CSS optimization
+# TO DO: Add support for other LLM providers
 
-import os
+import os, re
 import asyncio
 from typing import Dict, Any
-from huggingface_hub import InferenceClient
 from dotenv import load_dotenv
 import json
-
+from groq import Groq
 
 load_dotenv() 
 
-HF_TOKEN = os.getenv("HF_API_TOKEN", None)
-if not HF_TOKEN:
-    raise RuntimeError("Missing HuggingFace Token")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", None)
+if not GROQ_API_KEY:
+    raise RuntimeError("Missing Groq API Key")
 
-inference_client = InferenceClient(
-    token=HF_TOKEN
-)
+client = Groq(api_key=GROQ_API_KEY)
 
-MODEL_ID = "meta-llama/Llama-2-13b"
+MODEL_ID = "llama-3.3-70b-versatile"
+
+def truncate_css(css_text: str, max_chars: int = 15000) -> str:
+    """
+    Intelligently truncate CSS while preserving important styles
+    """
+    if len(css_text) <= max_chars:
+        return css_text
+    
+    print(f"🎨 CSS too long ({len(css_text)} chars), truncating to {max_chars} chars...")
+    
+    # Split CSS into rules
+    css_rules = []
+    current_rule = ""
+    brace_count = 0
+    
+    for char in css_text:
+        current_rule += char
+        if char == '{':
+            brace_count += 1
+        elif char == '}':
+            brace_count -= 1
+            if brace_count == 0:
+                css_rules.append(current_rule.strip())
+                current_rule = ""
+    
+    # Prioritize CSS rules by importance
+    priority_rules = []
+    normal_rules = []
+    
+    for rule in css_rules:
+        rule_lower = rule.lower()
+        # High priority: body, html, main layout elements, responsive styles
+        if any(keyword in rule_lower for keyword in [
+            'body', 'html', ':root', 'main', 'header', 'footer', 
+            'nav', 'section', 'article', '@media', 'container',
+            'grid', 'flex', 'layout', 'width', 'height', 'margin', 'padding'
+        ]):
+            priority_rules.append(rule)
+        else:
+            normal_rules.append(rule)
+    
+    # Combine rules until we hit the character limit
+    result_css = ""
+    
+    # Add priority rules first
+    for rule in priority_rules:
+        if len(result_css) + len(rule) <= max_chars:
+            result_css += rule + "\n"
+        else:
+            break
+    
+    # Add normal rules if space remains
+    for rule in normal_rules:
+        if len(result_css) + len(rule) <= max_chars:
+            result_css += rule + "\n"
+        else:
+            break
+    
+    print(f"🎨 CSS truncated from {len(css_text)} to {len(result_css)} chars")
+    return result_css
+
+def extract_essential_meta(head_html: str) -> str:
+    """
+    Extract only essential meta tags from head to save tokens
+    """
+    from bs4 import BeautifulSoup
+    
+    soup = BeautifulSoup(head_html, 'html.parser')
+    for a in soup.find_all("a"):
+        a['href'] = '#'
+    essential_tags = []
+    
+    # Keep essential meta tags
+    for tag in soup.find_all(['title', 'meta']):
+        if tag.name == 'title':
+            essential_tags.append(str(tag))
+        elif tag.name == 'meta':
+            # Keep viewport, charset, and description
+            attrs = tag.attrs
+            if any(key in attrs for key in ['charset', 'name', 'property']):
+                if attrs.get('name') in ['viewport', 'description'] or \
+                   attrs.get('property') in ['og:title', 'og:description'] or \
+                   'charset' in attrs:
+                    essential_tags.append(str(tag))
+    
+    return '\n'.join(essential_tags)
+
+def estimate_tokens(text: str) -> int:
+    """
+    Rough token estimation (1 token ≈ 4 characters for most models)
+    """
+    return len(text) // 4
 
 SYSTEM_PROMPT = """
-You are an expert front-end engineer. 
-Given the complete <head> HTML, the fully rendered <body> HTML (with all <img> tags now inlined as Base64), 
-and the critical CSS (only the CSS rules actually applied on this page during initial render), 
-produce a single, standalone HTML document that visually replicates the original website as closely as possible.
+You are an expert front-end engineer specializing in HTML/CSS replication.
 
-Requirements:
-- Include <meta> tags and <title> exactly as in the original <head>.
-- Inline the critical CSS inside a <style> tag in the final <head>.
-- Preserve all class names, IDs, and structural tags so that any additional CSS (if needed) still applies.
-- Ensure every image (already Base64 in the <body>) displays correctly.
-- Do not introduce any external references; the final document must be fully self-contained.
-- Use a minimal DOCTYPE declaration (<!DOCTYPE html>) at the very top.
-- Keep the original page’s language (<html lang="…">), if specified.
+Given the essential meta tags and the complete <body> HTML with CSS styles, produce a single, standalone HTML document that visually replicates the original website.
 
-If you believe some CSS rules are missing, you can re-derive them from context, but preserve exactly as much as you have been given before making changes.
+CRITICAL REQUIREMENTS:
+- Include ALL content from the <body> section exactly as provided
+- Preserve complete DOM structure with all nested elements
+- Include essential meta tags (title, viewport, charset)
+- Inline the provided CSS inside a <style> tag in the <head>
+- Maintain all class names, IDs, and structural tags
+- Keep all text content, links, and interactive elements
+- Use minimal DOCTYPE declaration (<!DOCTYPE html>)
+- Ensure the document is fully self-contained
 
-Return only the final HTML (no commentary, no markdown fences).
+STRUCTURE:
+```html
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Original Title</title>
+    <style>
+        /* Provided CSS here */
+    </style>
+</head>
+<body>
+    <!-- Complete body content exactly as provided -->
+</body>
+</html>
+```
+
+Return ONLY the final HTML document with no commentary or explanations.
 """
 
 async def generate_clone_html(design_ctx: Dict[str, str]) -> str:
     """
-    design_ctx: {
-      "head": "<head>…</head>",
-      "body": "<body>…</body>",
-      "css": "...critical CSS..."
-    }
-
-    We assemble a chat‐style payload with a system message + user message,
-    then call Hugging Face’s Inference API (Llama 2 chat endpoint).
+    Generate a full HTML clone without truncating CSS or body content.
     """
+
+    print("🤖 Starting full-fidelity LLM HTML generation...")
+
+    head_html = design_ctx.get("head", "")
+    body_html = design_ctx.get("body", "")
+    css_text = design_ctx.get("css", "")
+    url = design_ctx.get("url", "Unknown")
 
     user_message = f"""
-    <ORIGINAL_HEAD>
-    {design_ctx['head']}
-    </ORIGINAL_HEAD>
+    SOURCE URL: {url}
 
-    <CURRENT_BODY>
-    {design_ctx['body']}
-    </CURRENT_BODY>
+    <HEAD_SECTION>
+    {head_html}
+    </HEAD_SECTION>
 
-    <CRITICAL_CSS>
-    {design_ctx['css']}
-    </CRITICAL_CSS>
+    <BODY_SECTION>
+    {body_html}
+    </BODY_SECTION>
 
-    Generate a complete, standalone HTML document that, when opened in a browser, renders identically
-    to the original website. Include critical CSS in the <head> so that no external CSS files are needed.
+    <STYLE_SHEET>
+    {css_text}
+    </STYLE_SHEET>
+
+    Generate a complete standalone HTML document that includes:
+    1. The full <head> section from HEAD_SECTION (including all meta tags and scripts)
+    2. The complete <body> content from BODY_SECTION (preserve ALL nested elements)
+    3. All CSS styles from STYLE_SHEET embedded in a <style> tag inside <head>
+
+    IMPORTANT:
+    - Do NOT truncate or modify any of the content.
+    - Maintain full structure of <html>, <head>, and <body>.
+    - Return ONLY the complete HTML document starting with <!DOCTYPE html>.
     """
 
-    prompt = f"{SYSTEM_PROMPT.strip()}\n\n{user_message.strip()}"
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT.strip()},
+        {"role": "user", "content": user_message.strip()}
+    ]
+
+    print("📤 Sending full content to LLM...")
+    print(f"Final message length: {len(user_message)} characters")
 
     try:
-        response = inference_client.text_generation(
-            prompt,
-            model=MODEL_ID,
-            max_new_tokens=1024
+        response = await asyncio.to_thread(
+            lambda: client.chat.completions.create(
+                model=MODEL_ID,
+                messages=messages
+            )
         )
+
+        raw_response = response.choices[0].message.content.strip()
+        print(f"📥 LLM Response length: {len(raw_response)} characters")
+
+        # Return HTML directly if it starts with DOCTYPE
+        html_start = raw_response.find("<!DOCTYPE html>")
+        if html_start != -1:
+            return raw_response[html_start:]
+        else:
+            print("⚠️ LLM output missing <!DOCTYPE html>. Returning full response.")
+            return raw_response
+
     except Exception as e:
-        # Log and raise or return a friendly error
-        print("Error calling HF Inference API:", e)
-        raise RuntimeError("Failed to generate response from model") from e
-    
-    print("Raw HF response:", response)
-
-    # Handle standard response format
-    # If response is string, try parse JSON safely
-    if isinstance(response, str):
-        try:
-            response = json.loads(response)
-        except json.JSONDecodeError:
-            # Not JSON: raw error or HTML page returned
-            print("Raw response (not JSON):", response)
-            raise RuntimeError("Received non-JSON response from inference API")
-
-    # Now handle expected response formats
-    if isinstance(response, dict):
-        if "generated_text" in response:
-            return response["generated_text"].strip()
-        if "choices" in response and isinstance(response["choices"], list):
-            first = response["choices"][0]
-            if "message" in first and "content" in first["message"]:
-                return first["message"]["content"].strip()
-            
-    # The HF chat response will come back as a dict that—depending on the InferenceClient version—
-    # often looks like: {"generated_text": "<assistant>…final html…"}
-    # or {"choices": [{"message": {"content": "…html…"}}], …}
-    #
-    # We inspect common patterns:
-    # if isinstance(response, dict) and 'generated_text' in response:
-    #     # Case A: response has "choices" list → pick first choice’s message.content
-    #     if "choices" in response and isinstance(response["choices"], list):
-    #         first = response["choices"][0]
-    #         if "message" in first and "content" in first["message"]:
-    #             return first["message"]["content"].strip()
-    #         # fallback to generated_text if present
-    #     if "generated_text" in response:
-    #         # Usually has the entire assistant reply
-    #         return response["generated_text"].strip()
-
-    # If the shape is different, attempt a naive str(response)
-    return str(response).strip()
-
-
-        
-    
+        print(f"❌ Groq API error: {e}")
+        return f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+        {head_html}
+        <style>{css_text}</style>
+        </head>
+        {body_html}
+        </html>
+        """

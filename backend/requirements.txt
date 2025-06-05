@@ -6,5 +6,7 @@ beautifulsoup4
 python-multipart
 jinja2 
 python-dotenv
-playwright            
-huggingface_hub           
+playwright   
+groq
+google-genai         
+       
