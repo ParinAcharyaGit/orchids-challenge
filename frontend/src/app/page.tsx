@@ -1,6 +1,6 @@
 'use client'
 
-import React, { useState } from 'react'
+import React, { useState, useEffect, useRef } from 'react'
 import {
   Menu,
   X,
@@ -17,7 +17,8 @@ import {
   Mail,
   Phone,
   MapPin,
-  Download
+  Download,
+  MessageSquare
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
@@ -45,7 +46,17 @@ export default function LandingPage() {
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string>('')
   const [selectedModel, setSelectedModel] = useState('gemini-2.5-pro-preview-05-06')
-  const [processingStep, setProcessingStep] = useState<'idle' | 'scraping' | 'generating' | 'complete' | 'error'>('idle')
+  const [processingStep, setProcessingStep] = useState<'idle' | 'scraping' | 'generating' | 'complete' | 'error' | 'editing'>('idle')
+
+  // --- Chat Panel State ---
+  const [isChatPanelOpen, setIsChatPanelOpen] = useState(true);
+  const [chatMessages, setChatMessages] = useState<{sender: 'user' | 'ai', text: string}[]>([]);
+  const [chatInput, setChatInput] = useState('');
+  const [isEditing, setIsEditing] = useState(false);
+  const chatMessagesEndRef = useRef<HTMLDivElement>(null);
+
+  // --- State to hold the path of the latest scraped HTML ---
+  const [latestScrapedHtmlPath, setLatestScrapedHtmlPath] = useState<string | null>(null);
 
   const features = [
     {
@@ -102,6 +113,36 @@ export default function LandingPage() {
     { id: 'mixtral-8x7b-32768', name: 'Mixtral 8x7B (128K Context, Groq)' }
   ]
 
+  // --- Fetch latest scraped HTML path on page load or when clone is complete ---
+  useEffect(() => {
+      const fetchLatestScraped = async () => {
+          try {
+              const res = await fetch('/api/latest-scraped');
+              const data = await res.json();
+              if (res.ok && data.latest_scraped_path) {
+                  setLatestScrapedHtmlPath(data.latest_scraped_path);
+                  console.log("Fetched latest scraped HTML path:", data.latest_scraped_path);
+              } else {
+                   console.warn("No latest scraped HTML file found or error:", data.error);
+                   setLatestScrapedHtmlPath(null);
+              }
+          } catch (err) {
+              console.error("Failed to fetch latest scraped HTML path:", err);
+              setLatestScrapedHtmlPath(null);
+          }
+      };
+
+      if (currentPage === 'clone') {
+           fetchLatestScraped();
+      }
+
+  }, [currentPage]);
+
+   // --- Auto-scroll chat messages ---
+   useEffect(() => {
+     chatMessagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+   }, [chatMessages]);
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
     setError('')
@@ -110,6 +151,7 @@ export default function LandingPage() {
     setCurrentHtml(null)
     setLoading(true)
     setProcessingStep('scraping')
+    setLatestScrapedHtmlPath(null)
 
     try {
       console.log("Attempting to scrape:", url)
@@ -129,12 +171,12 @@ export default function LandingPage() {
       console.log("Scraping successful. Raw HTML received.", scrapeData)
       setRawHtml(scrapeData.raw_html)
       setCurrentHtml(scrapeData.raw_html)
+      setLatestScrapedHtmlPath(scrapeData.raw_html_path)
       setProcessingStep('generating')
       setLoading(false)
 
       // Step 2: Generate clean HTML (can happen in parallel or sequentially after showing raw)
       // For simplicity here, we call generate after scraping completes and raw is displayed.
-      // In a real app, generation might be a separate background task triggered by scrape completion.
       console.log("Attempting to generate HTML with model:", selectedModel)
       const generateRes = await fetch('/api/generate', {
         method: 'POST',
@@ -161,143 +203,287 @@ export default function LandingPage() {
       setError(err.message)
       setProcessingStep('error')
       setLoading(false)
-      if (!rawHtml) {
-        setCurrentHtml(null)
-      }
-    } finally {
     }
   }
+
+  // --- Handle Sending Edit Instruction ---
+  const handleSendEdit = async (e: React.FormEvent) => {
+      e.preventDefault();
+      if (!chatInput.trim() || !currentHtml) return;
+
+      const userMessage = chatInput;
+      setChatMessages(prev => [...prev, { sender: 'user', text: userMessage }]);
+      setChatInput('');
+      setIsEditing(true);
+      setProcessingStep('editing');
+
+      try {
+          console.log("Attempting to edit HTML with instruction:", userMessage);
+          const editRes = await fetch('/api/edit', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                  html_content: currentHtml,
+                  instruction: userMessage,
+                  model: 'gemini-2.5-pro-preview-05-06'
+              })
+          });
+
+          const editData = await editRes.json();
+
+          if (!editRes.ok) {
+              throw new Error(editData.detail || 'Failed to edit HTML');
+          }
+
+          console.log("HTML editing successful. Edited HTML received.", editData);
+
+          // Add AI response to chat
+          setChatMessages(prev => [...prev, { 
+              sender: 'ai', 
+              text: "Edit applied successfully. The changes have been saved and displayed." 
+          }]);
+
+          // Update the displayed HTML
+          setGeneratedHtml(editData.edited_html);
+          setCurrentHtml(editData.edited_html);
+          setProcessingStep('complete');
+          setError('');
+
+      } catch (err: any) {
+          console.error('Frontend error during editing process:', err);
+          setError(err.message);
+          setProcessingStep('error');
+          setChatMessages(prev => [...prev, { 
+              sender: 'ai', 
+              text: `Error applying edit: ${err.message}` 
+          }]);
+      } finally {
+          setIsEditing(false);
+      }
+  };
 
   const downloadHtml = () => {
     if (!currentHtml) return
     const blob = new Blob([currentHtml], { type: 'text/html' })
     const link = document.createElement('a')
     link.href = URL.createObjectURL(blob)
-    link.download = processingStep === 'complete' ? 'cloned_site_generated.html' : 'cloned_site_raw.html'
+    let filename = 'cloned_site.html';
+    if (processingStep === 'complete') {
+        if(generatedHtml && currentHtml === generatedHtml) {
+             filename = 'cloned_site_generated.html';
+        } else if (rawHtml && currentHtml === rawHtml) {
+             filename = 'cloned_site_raw.html';
+        } else {
+             filename = 'cloned_site_edited.html';
+        }
+    } else if (rawHtml && currentHtml === rawHtml) {
+         filename = 'cloned_site_raw.html';
+    } else {
+         filename = 'cloned_site.html';
+    }
+
+    link.download = filename;
     link.click()
     URL.revokeObjectURL(link.href)
   }
 
   if (currentPage === 'clone') {
     return (
-      <div className="min-h-screen bg-background">
-        <nav className="border-b">
-          <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-            <div className="flex justify-between items-center h-16">
-              <Button variant="ghost" onClick={() => setCurrentPage('home')}>
-                ← Back to Home
-              </Button>
-
-              <div className="hidden md:flex items-center space-x-8">
-                <Button variant="outline">Sign In</Button>
-                <Button>Get Started</Button>
-              </div>
-            </div>
-          </div>
-        </nav>
-
-        <div className="pt-20 px-4 sm:px-6 lg:px-8">
-          <div className="max-w-7xl mx-auto">
-            <div className="text-center mb-12">
-              <h1 className="text-4xl md:text-6xl font-bold mb-6">
-                Website <span className="text-muted-foreground">Cloner</span>
-              </h1>
-              <p className="text-xl text-muted-foreground mb-8">
-                Enter any public website URL to clone it instantly
-              </p>
-            </div>
-
-            <Card className="p-8 mb-8">
-              <form onSubmit={handleSubmit} className="flex gap-4 mb-6 items-start">
-                <Input
-                  type="url"
-                  placeholder="Enter a public website URL (e.g., https://example.com)"
-                  className="flex-1 text-lg py-6"
-                  value={url}
-                  onChange={(e) => setUrl(e.target.value)}
-                  required
-                  disabled={loading}
-                />
-                <Select value={selectedModel} onValueChange={setSelectedModel} disabled={loading}>
-                  <SelectTrigger className="w-[200px] h-[56px] text-lg">
-                    <SelectValue placeholder="Select AI Model" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {availableModels.map((model) => (
-                      <SelectItem key={model.id} value={model.id}>
-                        {model.name}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-                <Button type="submit" className="px-8 py-6 text-lg" disabled={loading}>
-                  {loading ? (
-                    <>
-                      <div className="animate-spin rounded-full h-5 w-5 border-b-2 border-foreground mr-2"></div>
-                      {processingStep === 'scraping' ? 'Scraping...' : 'Generating...'}
-                    </>
-                  ) : (
-                    <>
-                      <Zap className="w-5 h-5 mr-2" />
-                      Clone
-                    </>
-                  )}
-                </Button>
-              </form>
-
-              {processingStep !== 'idle' && processingStep !== 'complete' && processingStep !== 'error' && !error && (
-                <div className="mb-4 text-center text-muted-foreground">
-                  {processingStep === 'scraping' && 'Scraping website...'}
-                  {processingStep === 'generating' && 'Scraping complete. Generating clean HTML...'}
-                </div>
-              )}
-
-              {error && (
-                <div className="bg-destructive/20 border border-destructive/30 rounded-lg p-4 mb-6">
-                  <p className="text-destructive-foreground">{error}</p>
-                </div>
-              )}
-            </Card>
-
-            {currentHtml && (
-              <div className="space-y-6">
-                <Card className="p-6">
-                  <div className="flex justify-between items-center mb-4">
-                    <h2 className="text-2xl font-bold">
-                      {processingStep === 'complete' ? 'Generated HTML Preview' : 'Scraped HTML Preview'}
-                    </h2>
-                    <Button onClick={downloadHtml} variant="secondary">
-                      <Download className="w-4 h-4 mr-2" />
-                      Download HTML
-                    </Button>
-                  </div>
-
-                  <div className="border rounded-lg overflow-hidden" style={{ height: '600px' }}>
-                    <iframe
-                      title="Cloned Preview"
-                      srcDoc={currentHtml}
-                      className="w-full h-full"
-                      sandbox="allow-scripts allow-same-origin"
-                    />
-                  </div>
-
-                  {rawHtml && generatedHtml && processingStep === 'complete' && (
-                    <div className="mt-4 text-center text-muted-foreground">
-                      Now showing generated HTML.
-                      <Button variant="link" onClick={() => setCurrentHtml(rawHtml)} className="p-0 ml-2">Show Raw HTML</Button>
+      <div className="min-h-screen bg-background flex">
+        <div className={`flex-1 transition-all duration-300 ${isChatPanelOpen ? 'mr-80' : 'mr-0'}`}>
+            <nav className="border-b">
+                <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+                    <div className="flex justify-between items-center h-16">
+                        <Button variant="ghost" onClick={() => setCurrentPage('home')}>
+                            ← Back to Home
+                        </Button>
+                        <div className="hidden md:flex items-center space-x-8">
+                            <Button variant="outline">Sign In</Button>
+                            <Button>Get Started</Button>
+                        </div>
                     </div>
-                  )}
-                  {rawHtml && generatedHtml && currentHtml === rawHtml && (
-                    <div className="mt-4 text-center text-muted-foreground">
-                      Now showing raw HTML.
-                      <Button variant="link" onClick={() => setCurrentHtml(generatedHtml)} className="p-0 ml-2">Show Generated HTML</Button>
+                </div>
+            </nav>
+
+            <div className="pt-20 px-4 sm:px-6 lg:px-8">
+                <div className="max-w-7xl mx-auto">
+                    <div className="text-center mb-12">
+                        <h1 className="text-4xl md:text-6xl font-bold mb-6">
+                            Website <span className="text-muted-foreground">Cloner</span>
+                        </h1>
+                        <p className="text-xl text-muted-foreground mb-8">
+                            Enter any public website URL to clone it instantly
+                        </p>
                     </div>
-                  )}
-                </Card>
-              </div>
-            )}
-          </div>
+
+                    <Card className="p-8 mb-8">
+                        <form onSubmit={handleSubmit} className="flex gap-4 mb-6 items-start">
+                            <Input
+                                type="url"
+                                placeholder="Enter a public website URL (e.g., https://example.com)"
+                                className="flex-1 text-lg py-6"
+                                value={url}
+                                onChange={(e) => setUrl(e.target.value)}
+                                required
+                                disabled={loading || isEditing}
+                            />
+                            <Select value={selectedModel} onValueChange={setSelectedModel} disabled={loading || isEditing}>
+                                <SelectTrigger className="w-[200px] h-[56px] text-lg">
+                                    <SelectValue placeholder="Select AI Model" />
+                                </SelectTrigger>
+                                <SelectContent>
+                                    {availableModels.map((model) => (
+                                        <SelectItem key={model.id} value={model.id}>
+                                            {model.name}
+                                        </SelectItem>
+                                    ))}
+                                </SelectContent>
+                            </Select>
+                            <Button type="submit" className="px-8 py-6 text-lg" disabled={loading || isEditing}>
+                                {loading ? (
+                                    <>
+                                        <div className="animate-spin rounded-full h-5 w-5 border-b-2 border-foreground mr-2"></div>
+                                        {processingStep === 'scraping' ? 'Scraping...' : 'Generating...'}
+                                    </>
+                                ) : (
+                                    <>
+                                        <Zap className="w-5 h-5 mr-2" />
+                                        Clone
+                                    </>
+                                )}
+                            </Button>
+                        </form>
+
+                        {processingStep !== 'idle' && processingStep !== 'complete' && processingStep !== 'error' && !error && (
+                            <div className="mb-4 text-center text-muted-foreground">
+                                {processingStep === 'scraping' && 'Scraping website...'}
+                                {processingStep === 'generating' && 'Scraping complete. Generating clean HTML...'}
+                                {processingStep === 'editing' && 'Applying edit with AI...'}
+                            </div>
+                        )}
+
+                        {error && (
+                            <div className="bg-destructive/20 border border-destructive/30 rounded-lg p-4 mb-6">
+                                <p className="text-destructive-foreground">{error}</p>
+                            </div>
+                        )}
+                    </Card>
+
+                    {currentHtml && (
+                        <div className="space-y-6">
+                            <Card className="p-6">
+                                <div className="flex justify-between items-center mb-4">
+                                    <h2 className="text-2xl font-bold">
+                                        {processingStep === 'complete' ?
+                                            (generatedHtml && currentHtml === generatedHtml ? 'Generated HTML Preview' : (rawHtml && currentHtml === rawHtml ? 'Scraped HTML Preview' : 'Edited HTML Preview'))
+                                            : 'Scraped HTML Preview'
+                                        }
+                                    </h2>
+                                    <Button onClick={downloadHtml} variant="secondary">
+                                        <Download className="w-4 h-4 mr-2" />
+                                        Download HTML
+                                    </Button>
+                                </div>
+
+                                <div className="border rounded-lg overflow-hidden" style={{ height: '600px' }}>
+                                    <iframe
+                                        title="Cloned Preview"
+                                        srcDoc={currentHtml}
+                                        className="w-full h-full"
+                                        sandbox="allow-scripts allow-same-origin"
+                                    />
+                                </div>
+
+                                {(rawHtml || generatedHtml) && (
+                                     <div className="mt-4 text-center text-muted-foreground">
+                                         {rawHtml && generatedHtml && processingStep === 'complete' && currentHtml !== rawHtml && (
+                                             <Button variant="link" onClick={() => setCurrentHtml(rawHtml)} className="p-0 ml-2">Show Raw HTML</Button>
+                                         )}
+                                         {rawHtml && generatedHtml && processingStep === 'complete' && currentHtml !== generatedHtml && (
+                                             <Button variant="link" onClick={() => setCurrentHtml(generatedHtml)} className="p-0 ml-2">Show Generated HTML</Button>
+                                         )}
+                                     </div>
+                                )}
+                            </Card>
+                        </div>
+                    )}
+                </div>
+            </div>
         </div>
+
+        <div className={`fixed inset-y-0 right-0 w-80 bg-card border-l transition-transform duration-300 ease-in-out ${isChatPanelOpen ? 'translate-x-0' : 'translate-x-full'}`}>
+            <div className="flex flex-col h-full">
+                <div className="flex items-center justify-between p-4 border-b">
+                    <h3 className="text-lg font-semibold">AI Editor Chat</h3>
+                    <Button variant="ghost" size="sm" onClick={() => setIsChatPanelOpen(false)}>
+                        <X className="w-5 h-5" />
+                    </Button>
+                </div>
+
+                <div className="flex-1 overflow-y-auto p-4 space-y-4">
+                    {chatMessages.map((msg, index) => (
+                        <div key={index} className={`flex ${msg.sender === 'user' ? 'justify-end' : 'justify-start'}`}>
+                            <div className={`max-w-[80%] rounded-lg p-3 ${
+                                msg.sender === 'user' 
+                                    ? 'bg-primary text-primary-foreground' 
+                                    : 'bg-muted'
+                            }`}>
+                                {msg.text}
+                            </div>
+                        </div>
+                    ))}
+                    {isEditing && (
+                        <div className="flex justify-start">
+                            <div className="max-w-[80%] rounded-lg p-3 bg-muted">
+                                <div className="animate-pulse">Processing edit...</div>
+                            </div>
+                        </div>
+                    )}
+                    <div ref={chatMessagesEndRef} />
+                </div>
+
+                <div className="p-4 border-t">
+                    <form onSubmit={handleSendEdit} className="flex flex-col gap-2">
+                        <Textarea
+                            placeholder="Type your editing instruction here..."
+                            value={chatInput}
+                            onChange={(e) => setChatInput(e.target.value)}
+                            disabled={isEditing || loading}
+                            className="min-h-[100px] resize-none"
+                        />
+                        <Button 
+                            type="submit" 
+                            disabled={isEditing || loading || !chatInput.trim()}
+                            className="w-full"
+                        >
+                            {isEditing ? (
+                                <div className="flex items-center">
+                                    <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-foreground mr-2"></div>
+                                    Processing...
+                                </div>
+                            ) : (
+                                <div className="flex items-center">
+                                    <MessageSquare className="w-4 h-4 mr-2" />
+                                    Send Edit
+                                </div>
+                            )}
+                        </Button>
+                    </form>
+                </div>
+            </div>
+        </div>
+
+        {currentPage === 'clone' && (
+            <Button
+                variant="secondary"
+                size="icon"
+                className={`fixed bottom-4 right-4 rounded-full shadow-lg transition-transform duration-300 ${isChatPanelOpen ? 'translate-x-[-21rem]' : 'translate-x-0'}`}
+                onClick={() => setIsChatPanelOpen(!isChatPanelOpen)}
+                disabled={loading}
+            >
+                <MessageSquare className="w-6 h-6" />
+            </Button>
+        )}
       </div>
     )
   }

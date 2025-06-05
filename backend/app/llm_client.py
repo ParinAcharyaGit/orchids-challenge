@@ -10,6 +10,7 @@ import json
 from groq import Groq
 import logging
 import google.generativeai as genai
+from bs4 import BeautifulSoup
 
 load_dotenv() 
 
@@ -105,8 +106,6 @@ def extract_essential_meta(head_html: str) -> str:
     """
     Extract only essential meta tags from head to save tokens
     """
-    from bs4 import BeautifulSoup
-    
     soup = BeautifulSoup(head_html, 'html.parser')
     for a in soup.find_all("a"):
         a['href'] = '#'
@@ -133,7 +132,7 @@ def estimate_tokens(text: str) -> int:
     """
     return len(text) // 4
 
-SYSTEM_PROMPT = """
+SYSTEM_PROMPT_CLONE = """
 You are an expert front-end engineer specializing in HTML/CSS replication.
 
 Given the following website context, produce a single, standalone HTML document that visually replicates the original website.
@@ -182,15 +181,38 @@ STRUCTURE:
 Return ONLY the HTML code block, starting with ```html and ending with ```.
 """
 
-def create_prompt(design_context: dict) -> str:
-    """Create a standardized prompt for all models"""
+# Define a separate system prompt for editing
+SYSTEM_PROMPT_EDIT = """
+You are an expert front-end engineer who can perform precise edits on HTML code based on user instructions.
+
+Given the following HTML content and a specific editing instruction, produce the *full, modified* HTML document.
+
+INPUT HTML:
+```html
+{html_content}
+```
+
+EDITING INSTRUCTION:
+{instruction}
+
+CRITICAL REQUIREMENTS:
+- Apply the editing instruction accurately to the provided HTML.
+- Maintain the overall structure and integrity of the original HTML.
+- Ensure the output is valid, standalone HTML5.
+- Include all original parts of the HTML except those modified by the instruction.
+- Preserve existing inline styles and script tags unless the instruction explicitly requires modifying them.
+- Do NOT add any extra commentary, explanations, or markdown formatting outside the ```html``` block.
+- Return ONLY the full, edited HTML code block.
+
+Return ONLY the HTML code block, starting with ```html and ending with ```.
+"""
+
+def create_prompt_clone(design_context: dict) -> str:
+    """Create a standardized prompt for cloning based on design context."""
     head_content = design_context.get('head', '').strip()
     body_content = design_context.get('body', '').strip()
     css_content = design_context.get('css', '').strip()
 
-    # Basic structure for head content, ensure essential metas are there
-    # This is a simplification; ideally, extract_essential_meta should process head_content
-    # For now, include the raw head content and prompt the model to be smart
     processed_head = head_content if head_content else "<title>Cloned Page</title>" # Ensure at least a title
 
     css_section_prompt = f"""
@@ -247,6 +269,10 @@ CSS:
     Return ONLY the HTML code block, starting with ```html and ending with ```.
     """
 
+def create_prompt_edit(html_content: str, instruction: str) -> str:
+    """Create a prompt for editing HTML."""
+    return SYSTEM_PROMPT_EDIT.format(html_content=html_content, instruction=instruction)
+
 async def generate_clone_html(design_context: dict, model_id: str) -> str:
     """
     Generate cloned HTML using the specified LLM (Groq or Google).
@@ -256,19 +282,17 @@ async def generate_clone_html(design_context: dict, model_id: str) -> str:
 
     try:
         if provider == LLMProvider.GOOGLE:
-            return await generate_with_google(model_name, design_context)
+            return await generate_with_google(model_name, create_prompt_clone(design_context))
         elif provider == LLMProvider.GROQ:
-            return await generate_with_groq(model_name, design_context)
+            return await generate_with_groq(model_name, create_prompt_clone(design_context))
     except Exception as e:
         logger.error(f"Error generating HTML with {provider}: {str(e)}")
         raise
 
-async def generate_with_google(model_name: str, design_context: dict) -> str:
+async def generate_with_google(model_name: str, prompt: str) -> str:
     """Generate HTML using Google's Gemini model"""
     try:
         model = genai.GenerativeModel(model_name)
-        prompt = create_prompt(design_context)
-
         response = model.generate_content(prompt)
 
         return response.text
@@ -276,16 +300,13 @@ async def generate_with_google(model_name: str, design_context: dict) -> str:
         logger.error(f"Google AI generation error: {str(e)}")
         raise
 
-async def generate_with_groq(model_name: str, design_context: dict) -> str:
+async def generate_with_groq(model_name: str, prompt: str) -> str:
     """Generate HTML using Groq's models"""
     try:
-        prompt = create_prompt(design_context)
-
         response = await groq_client.chat.completions.create(
             model=model_name,
             messages=[
-                {"role": "system", "content": "You are an expert front-end engineer specializing in HTML/CSS replication. " + SYSTEM_PROMPT},
-                {"role": "user", "content": f"Generate a clean, standalone HTML version based on this context:\n\n{create_prompt(design_context)}"}
+                {"role": "user", "content": prompt}
             ],
             temperature=0.7,
         )
@@ -294,9 +315,35 @@ async def generate_with_groq(model_name: str, design_context: dict) -> str:
         if html_match:
             return html_match.group(1).strip()
         else:
-            logger.warning("Groq response did not contain an HTML code block. Returning full response.")
+            logger.warning(f"Groq response for model {model_name} did not contain an HTML code block. Returning full response. Content snippet: {content[:200]}...")
             return content.strip()
 
     except Exception as e:
         logger.error(f"Groq generation error: {str(e)}")
+        raise
+
+# --- New function for HTML Editing ---
+async def edit_html_with_gemini(html_content: str, instruction: str, model_id: str = 'gemini-2.5-pro-preview-05-06') -> str:
+    """
+    Edit HTML content using a specified Gemini model.
+    """
+    provider, model_name = get_model_config(model_id)
+    if provider != LLMProvider.GOOGLE:
+        raise ValueError(f"Model {model_id} is not a supported Google model for editing.")
+
+    logger.info(f"Editing HTML using Gemini model: {model_name}")
+
+    try:
+        prompt = create_prompt_edit(html_content, instruction)
+        edited_html = await generate_with_google(model_name, prompt)
+
+        html_match = re.search(r'```html\n(.*?)\n```', edited_html, re.DOTALL)
+        if html_match:
+            return html_match.group(1).strip()
+        else:
+            logger.warning("Gemini response for editing did not contain an HTML code block. Returning full response.")
+            return edited_html.strip()
+
+    except Exception as e:
+        logger.error(f"Error editing HTML with Gemini model {model_id}: {str(e)}")
         raise

@@ -13,10 +13,11 @@ import time
 from pathlib import Path
 import hashlib
 from bs4 import BeautifulSoup
+import glob # Import glob to find files
 
-from models import CloneRequest, ScrapeRequest
+from models import CloneRequest, ScrapeRequest, EditRequest, EditResponse, LatestScrapedResponse
 from scraper_sync import fetch_design_context_sync
-from llm_client import generate_clone_html, generate_with_google
+from llm_client import generate_clone_html, generate_with_google, edit_html_with_gemini
 
 load_dotenv()
 app = FastAPI()
@@ -202,6 +203,95 @@ async def generate_website_endpoint(request: CloneRequest):
         logger.error(f"❌ Unexpected error during generation: {str(e)}", exc_info=True)
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Internal server error during generation: {str(e)}")
 
+@app.get("/api/latest-scraped", response_model=LatestScrapedResponse)
+async def get_latest_scraped_file():
+    """
+    Find the path of the most recently saved raw scraped HTML file.
+    """
+    try:
+        # List all files matching the pattern *_*_raw.html
+        scraped_files = sorted(
+            CLONED_SITES_DIR.glob("*_*_raw.html"),
+            key=os.path.getmtime, # Sort by modification time
+            reverse=True # Get the latest first
+        )
+
+        if not scraped_files:
+            logger.warning("No raw scraped HTML files found.")
+            return LatestScrapedResponse(latest_scraped_path=None, error="No raw scraped HTML files found.")
+
+        latest_file_path = scraped_files[0]
+        logger.info(f"Found latest scraped file: {latest_file_path}")
+        return LatestScrapedResponse(latest_scraped_path=str(latest_file_path))
+
+    except Exception as e:
+        logger.error(f"❌ Error finding latest scraped file: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Internal server error finding latest scraped file: {str(e)}")
+
+@app.post("/api/edit", response_model=EditResponse)
+async def edit_html_endpoint(request: EditRequest):
+    """
+    Edit HTML content using a specified LLM based on user instruction.
+    """
+    start_time = time.time()
+    html_content_to_edit = request.html_content
+    instruction = request.instruction
+    model_id = request.model # Should default to Gemini Pro
+
+    logger.info(f"✂️ Starting HTML editing with model: {model_id}")
+    logger.info(f"Instruction: {instruction}")
+    # Log snippet of HTML to edit
+    logger.info(f"Editing HTML (snippet): {html_content_to_edit[:200]}...")
+
+
+    try:
+        llm_start = time.time()
+        # Use the new editing function in llm_client
+        edited_html = await edit_html_with_gemini(html_content_to_edit, instruction, model_id=model_id)
+        llm_time = time.time() - llm_start
+
+        if not edited_html or len(edited_html) < 100:
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="LLM failed to generate valid edited HTML content or content is too short")
+
+        # Check if it starts with doctype case-insensitively and optionally whitespace
+        if not re.match(r'^\s*<!DOCTYPE', edited_html, re.IGNORECASE):
+             logger.warning("⚠️  Edited HTML doesn't start with <!DOCTYPE")
+
+
+        # 💾 Save edited HTML to disk
+        # Need a way to link edited file back to original scrape/generation.
+        # For simplicity, let's just append "_edited" and a timestamp.
+        timestamp_str = time.strftime("%Y%m%d_%H%M%S", time.gmtime())
+
+        # Attempt to get the base filename from the raw_html_path if available,
+        # though this endpoint receives html_content directly.
+        # If you want to track edits of specific files, the request should ideally include the source file path.
+        # For now, let's create a new file named based on timestamp and a simple hash of the edited content or instruction
+        instruction_hash = hashlib.md5(instruction.encode('utf-8')).hexdigest()[:8]
+        filename = f"{timestamp_str}_edited_{instruction_hash}_{model_id.replace('-', '_')}.html"
+        edited_html_path = CLONED_SITES_DIR / filename
+
+        with open(edited_html_path, "w", encoding="utf-8") as f:
+            f.write(edited_html)
+        logger.info(f"📁 Saved edited HTML to {edited_html_path}")
+
+        total_time = time.time() - start_time
+        logger.info(f"✅ HTML editing completed successfully in {total_time:.2f}s")
+        logger.info(f"📊 Edited HTML size: {len(edited_html)} characters")
+
+        # Return the edited HTML content
+        return EditResponse(
+            edited_html=edited_html,
+            processing_time=round(total_time, 2),
+            timestamp=time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime()),
+            # debug_info=... # Include any debug info from the LLM call if available
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Unexpected error during HTML editing: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Internal server error during HTML editing: {str(e)}")
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)
