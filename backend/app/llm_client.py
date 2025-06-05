@@ -4,20 +4,42 @@
 
 import os, re
 import asyncio
-from typing import Dict, Any
+from typing import Dict, Any, Literal
 from dotenv import load_dotenv
 import json
 from groq import Groq
+import logging
+import google.generativeai as genai
 
 load_dotenv() 
 
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", None)
-if not GROQ_API_KEY:
-    raise RuntimeError("Missing Groq API Key")
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-client = Groq(api_key=GROQ_API_KEY)
+# Initialize clients
+genai.configure(api_key=os.getenv('GOOGLE_API_KEY'))
+groq_client = Groq(api_key=os.getenv('GROQ_API_KEY'))
 
-MODEL_ID = "llama-3.3-70b-versatile"
+class LLMProvider:
+    GROQ = "groq"
+    GOOGLE = "google"
+
+def get_model_config(model_id: str) -> tuple[str, str]:
+    """
+    Returns (provider, model_name) for the given model_id
+    """
+    model_map = {
+        'llama-3.3-70b-versatile': (LLMProvider.GROQ, 'llama-3.3-70b-versatile'),
+        'gemini-2.5-pro-preview-05-06': (LLMProvider.GOOGLE, 'gemini-2.5-pro-preview-05-06'),
+        'mixtral-8x7b-32768': (LLMProvider.GROQ, 'mixtral-8x7b-32768')
+    }
+    config = model_map.get(model_id)
+    if config is None:
+         logger.error(f"Unknown model ID: {model_id}. Valid models are: {list(model_map.keys())}")
+         raise ValueError(f"Unsupported model ID: {model_id}")
+
+    return config
 
 def truncate_css(css_text: str, max_chars: int = 15000) -> str:
     """
@@ -114,17 +136,29 @@ def estimate_tokens(text: str) -> int:
 SYSTEM_PROMPT = """
 You are an expert front-end engineer specializing in HTML/CSS replication.
 
-Given the essential meta tags and the complete <body> HTML with CSS styles, produce a single, standalone HTML document that visually replicates the original website.
+Given the following website context, produce a single, standalone HTML document that visually replicates the original website.
+
+CONTEXT:
+
+Head content:
+{head_content}
+
+Body content:
+{body_content}
+
+CSS:
+{css_content}
 
 CRITICAL REQUIREMENTS:
-- Include ALL content from the <body> section exactly as provided
-- Preserve complete DOM structure with all nested elements
-- Include essential meta tags (title, viewport, charset)
-- Inline the provided CSS inside a <style> tag in the <head>
-- Maintain all class names, IDs, and structural tags
-- Keep all text content, links, and interactive elements
-- Use minimal DOCTYPE declaration (<!DOCTYPE html>)
-- Ensure the document is fully self-contained
+- Generate valid HTML5, fully self-contained.
+- Include relevant content from the CONTEXT sections.
+- Preserve key structural elements, class names, and IDs from the body content.
+- Inline the provided CSS (if any) inside a <style> tag in the <head>.
+- Ensure the document is responsive.
+- Keep text content, links, and interactive elements.
+- Use minimal DOCTYPE declaration (<!DOCTYPE html>).
+- Do NOT include any external stylesheets or scripts unless explicitly necessary and inlined.
+- Return ONLY the final HTML document with no commentary or explanations outside the ```html``` block.
 
 STRUCTURE:
 ```html
@@ -133,94 +167,136 @@ STRUCTURE:
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Original Title</title>
+    <title>Original Title</title> {/* Placeholder, ideally get from head */}
     <style>
-        /* Provided CSS here */
+        /* Provided CSS here (if any) */
     </style>
+    <!-- Other essential meta tags from context -->
 </head>
 <body>
-    <!-- Complete body content exactly as provided -->
+    <!-- Replicated body content -->
 </body>
 </html>
 ```
 
-Return ONLY the final HTML document with no commentary or explanations.
+Return ONLY the HTML code block, starting with ```html and ending with ```.
 """
 
-async def generate_clone_html(design_ctx: Dict[str, str]) -> str:
+def create_prompt(design_context: dict) -> str:
+    """Create a standardized prompt for all models"""
+    head_content = design_context.get('head', '').strip()
+    body_content = design_context.get('body', '').strip()
+    css_content = design_context.get('css', '').strip()
+
+    # Basic structure for head content, ensure essential metas are there
+    # This is a simplification; ideally, extract_essential_meta should process head_content
+    # For now, include the raw head content and prompt the model to be smart
+    processed_head = head_content if head_content else "<title>Cloned Page</title>" # Ensure at least a title
+
+    css_section_prompt = f"""
+CSS:
+{css_content}
+    """ if css_content else "No specific CSS provided, use general styling principles for a clean, modern look."
+
+
+    return f"""
+    You are an expert front-end engineer specializing in HTML/CSS replication.
+
+    Given the following website context, produce a single, standalone HTML document that visually replicates the original website.
+
+    CONTEXT:
+
+    Head content:
+    {processed_head}
+
+    Body content:
+    {body_content}
+
+    {css_section_prompt}
+
+    CRITICAL REQUIREMENTS:
+    - Generate valid HTML5, fully self-contained.
+    - Include relevant content from the CONTEXT sections.
+    - Preserve key structural elements, class names, and IDs from the body content.
+    - Inline the provided CSS (if any) inside a <style> tag in the <head>.
+    - Ensure the document is responsive.
+    - Keep text content, links, and interactive elements.
+    - Use minimal DOCTYPE declaration (<!DOCTYPE html>).
+    - Do NOT include any external stylesheets or scripts unless explicitly necessary and inlined.
+    - Return ONLY the final HTML document with no commentary or explanations outside the ```html``` block.
+
+    STRUCTURE:
+    ```html
+    <!DOCTYPE html>
+    <html>
+    <head>
+        {processed_head}
+        <style>
+            /* Provided CSS here (if any) */
+        </style>
+        <!-- Ensure essential meta tags like charset and viewport are present if not in provided head -->
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+    </head>
+    <body>
+        {body_content}
+    </body>
+    </html>
+    ```
+
+    Return ONLY the HTML code block, starting with ```html and ending with ```.
     """
-    Generate a full HTML clone without truncating CSS or body content.
+
+async def generate_clone_html(design_context: dict, model_id: str) -> str:
     """
-
-    print("🤖 Starting full-fidelity LLM HTML generation...")
-
-    head_html = design_ctx.get("head", "")
-    body_html = design_ctx.get("body", "")
-    css_text = design_ctx.get("css", "")
-    url = design_ctx.get("url", "Unknown")
-
-    user_message = f"""
-    SOURCE URL: {url}
-
-    <HEAD_SECTION>
-    {head_html}
-    </HEAD_SECTION>
-
-    <BODY_SECTION>
-    {body_html}
-    </BODY_SECTION>
-
-    <STYLE_SHEET>
-    {css_text}
-    </STYLE_SHEET>
-
-    Generate a complete standalone HTML document that includes:
-    1. The full <head> section from HEAD_SECTION (including all meta tags and scripts)
-    2. The complete <body> content from BODY_SECTION (preserve ALL nested elements)
-    3. All CSS styles from STYLE_SHEET embedded in a <style> tag inside <head>
-
-    IMPORTANT:
-    - Do NOT truncate or modify any of the content.
-    - Maintain full structure of <html>, <head>, and <body>.
-    - Return ONLY the complete HTML document starting with <!DOCTYPE html>.
+    Generate cloned HTML using the specified LLM (Groq or Google).
     """
-
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT.strip()},
-        {"role": "user", "content": user_message.strip()}
-    ]
-
-    print("📤 Sending full content to LLM...")
-    print(f"Final message length: {len(user_message)} characters")
+    provider, model_name = get_model_config(model_id)
+    logger.info(f"Using {provider} provider with model {model_name}")
 
     try:
-        response = await asyncio.to_thread(
-            lambda: client.chat.completions.create(
-                model=MODEL_ID,
-                messages=messages
-            )
+        if provider == LLMProvider.GOOGLE:
+            return await generate_with_google(model_name, design_context)
+        elif provider == LLMProvider.GROQ:
+            return await generate_with_groq(model_name, design_context)
+    except Exception as e:
+        logger.error(f"Error generating HTML with {provider}: {str(e)}")
+        raise
+
+async def generate_with_google(model_name: str, design_context: dict) -> str:
+    """Generate HTML using Google's Gemini model"""
+    try:
+        model = genai.GenerativeModel(model_name)
+        prompt = create_prompt(design_context)
+
+        response = model.generate_content(prompt)
+
+        return response.text
+    except Exception as e:
+        logger.error(f"Google AI generation error: {str(e)}")
+        raise
+
+async def generate_with_groq(model_name: str, design_context: dict) -> str:
+    """Generate HTML using Groq's models"""
+    try:
+        prompt = create_prompt(design_context)
+
+        response = await groq_client.chat.completions.create(
+            model=model_name,
+            messages=[
+                {"role": "system", "content": "You are an expert front-end engineer specializing in HTML/CSS replication. " + SYSTEM_PROMPT},
+                {"role": "user", "content": f"Generate a clean, standalone HTML version based on this context:\n\n{create_prompt(design_context)}"}
+            ],
+            temperature=0.7,
         )
-
-        raw_response = response.choices[0].message.content.strip()
-        print(f"📥 LLM Response length: {len(raw_response)} characters")
-
-        # Return HTML directly if it starts with DOCTYPE
-        html_start = raw_response.find("<!DOCTYPE html>")
-        if html_start != -1:
-            return raw_response[html_start:]
+        content = response.choices[0].message.content
+        html_match = re.search(r'```html\n(.*?)\n```', content, re.DOTALL)
+        if html_match:
+            return html_match.group(1).strip()
         else:
-            print("⚠️ LLM output missing <!DOCTYPE html>. Returning full response.")
-            return raw_response
+            logger.warning("Groq response did not contain an HTML code block. Returning full response.")
+            return content.strip()
 
     except Exception as e:
-        print(f"❌ Groq API error: {e}")
-        return f"""
-        <!DOCTYPE html>
-        <html>
-        <head>
-        {head_html}
-        <style>{css_text}</style>
-        </head>
-        {body_html}
-        </html>
-        """
+        logger.error(f"Groq generation error: {str(e)}")
+        raise

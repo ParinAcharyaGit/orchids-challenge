@@ -25,6 +25,13 @@ import { Input } from '@/components/ui/input'
 import { Textarea } from '@/components/ui/textarea'
 import { Badge } from '@/components/ui/badge'
 import { Separator } from '@/components/ui/separator'
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select"
 
 export default function LandingPage() {
   const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false)
@@ -32,9 +39,13 @@ export default function LandingPage() {
 
   // Clone page state
   const [url, setUrl] = useState<string>('')
-  const [html, setHtml] = useState<string | null>(null)
+  const [rawHtml, setRawHtml] = useState<string | null>(null)
+  const [generatedHtml, setGeneratedHtml] = useState<string | null>(null)
+  const [currentHtml, setCurrentHtml] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string>('')
+  const [selectedModel, setSelectedModel] = useState('gemini-2.5-pro-preview-05-06')
+  const [processingStep, setProcessingStep] = useState<'idle' | 'scraping' | 'generating' | 'complete' | 'error'>('idle')
 
   const features = [
     {
@@ -85,58 +96,91 @@ export default function LandingPage() {
     }
   ]
 
-  // Triggers the cloning process
-  // Updated to handle response types correctly
+  const availableModels = [
+    { id: 'llama-3.3-70b-versatile', name: 'Llama 3.3 70B Versatile (Groq)' },
+    { id: 'gemini-2.5-pro-preview-05-06', name: 'Gemini 2.5 Pro' },
+    { id: 'mixtral-8x7b-32768', name: 'Mixtral 8x7B (128K Context, Groq)' }
+  ]
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
     setError('')
-    setHtml(null)
+    setRawHtml(null)
+    setGeneratedHtml(null)
+    setCurrentHtml(null)
     setLoading(true)
-  
+    setProcessingStep('scraping')
+
     try {
-      const res = await fetch('/api/clone', {
+      console.log("Attempting to scrape:", url)
+      // Step 1: Scrape the website
+      const scrapeRes = await fetch('/api/scrape', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ url })
       })
-  
-      const contentType = res.headers.get('content-type')
-      console.log('Response content-type:', contentType)
-      const isJson = res.headers.get('content-type')?.includes('application/json')
-  
-      if (!res.ok) {
-        const errMessage = isJson
-          ? (await res.json()).detail
-          : await res.text()
-        throw new Error(errMessage || 'Unknown error occurred')
+
+      const scrapeData = await scrapeRes.json()
+
+      if (!scrapeRes.ok) {
+        throw new Error(scrapeData.detail || 'Failed to scrape website')
       }
-  
-      const data = isJson ? await res.json() : null
-      setHtml(data?.html || '')
-    } catch (err: any) {
-      console.error('Frontend error:', err)
-      setError(err.message)
-    } finally {
+
+      console.log("Scraping successful. Raw HTML received.", scrapeData)
+      setRawHtml(scrapeData.raw_html)
+      setCurrentHtml(scrapeData.raw_html)
+      setProcessingStep('generating')
       setLoading(false)
+
+      // Step 2: Generate clean HTML (can happen in parallel or sequentially after showing raw)
+      // For simplicity here, we call generate after scraping completes and raw is displayed.
+      // In a real app, generation might be a separate background task triggered by scrape completion.
+      console.log("Attempting to generate HTML with model:", selectedModel)
+      const generateRes = await fetch('/api/generate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ raw_html_path: scrapeData.raw_html_path, model: selectedModel })
+      })
+
+      const generateData = await generateRes.json()
+
+      if (!generateRes.ok) {
+        throw new Error(generateData.detail || 'Failed to generate HTML')
+      }
+
+      console.log("HTML generation successful. Generated HTML received.", generateData)
+      setGeneratedHtml(generateData.generated_html)
+      setTimeout(() => {
+        setCurrentHtml(generateData.generated_html)
+        setProcessingStep('complete')
+        console.log("Displayed generated HTML.")
+      }, 2000)
+
+    } catch (err: any) {
+      console.error('Frontend error during cloning process:', err)
+      setError(err.message)
+      setProcessingStep('error')
+      setLoading(false)
+      if (!rawHtml) {
+        setCurrentHtml(null)
+      }
+    } finally {
     }
   }
-  
 
   const downloadHtml = () => {
-    if (!html) return
-    const blob = new Blob([html], { type: 'text/html' })
+    if (!currentHtml) return
+    const blob = new Blob([currentHtml], { type: 'text/html' })
     const link = document.createElement('a')
     link.href = URL.createObjectURL(blob)
-    link.download = 'cloned_site.html'
+    link.download = processingStep === 'complete' ? 'cloned_site_generated.html' : 'cloned_site_raw.html'
     link.click()
     URL.revokeObjectURL(link.href)
   }
 
-  // If we’re on the “clone” page, render the clone UI:
   if (currentPage === 'clone') {
     return (
       <div className="min-h-screen bg-background">
-        {/* Navbar for Clone Page */}
         <nav className="border-b">
           <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
             <div className="flex justify-between items-center h-16">
@@ -152,7 +196,6 @@ export default function LandingPage() {
           </div>
         </nav>
 
-        {/* Clone Page Content */}
         <div className="pt-20 px-4 sm:px-6 lg:px-8">
           <div className="max-w-7xl mx-auto">
             <div className="text-center mb-12">
@@ -165,7 +208,7 @@ export default function LandingPage() {
             </div>
 
             <Card className="p-8 mb-8">
-              <form onSubmit={handleSubmit} className="flex gap-4 mb-6">
+              <form onSubmit={handleSubmit} className="flex gap-4 mb-6 items-start">
                 <Input
                   type="url"
                   placeholder="Enter a public website URL (e.g., https://example.com)"
@@ -173,12 +216,25 @@ export default function LandingPage() {
                   value={url}
                   onChange={(e) => setUrl(e.target.value)}
                   required
+                  disabled={loading}
                 />
+                <Select value={selectedModel} onValueChange={setSelectedModel} disabled={loading}>
+                  <SelectTrigger className="w-[200px] h-[56px] text-lg">
+                    <SelectValue placeholder="Select AI Model" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {availableModels.map((model) => (
+                      <SelectItem key={model.id} value={model.id}>
+                        {model.name}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
                 <Button type="submit" className="px-8 py-6 text-lg" disabled={loading}>
                   {loading ? (
                     <>
                       <div className="animate-spin rounded-full h-5 w-5 border-b-2 border-foreground mr-2"></div>
-                      Cloning...
+                      {processingStep === 'scraping' ? 'Scraping...' : 'Generating...'}
                     </>
                   ) : (
                     <>
@@ -189,6 +245,13 @@ export default function LandingPage() {
                 </Button>
               </form>
 
+              {processingStep !== 'idle' && processingStep !== 'complete' && processingStep !== 'error' && !error && (
+                <div className="mb-4 text-center text-muted-foreground">
+                  {processingStep === 'scraping' && 'Scraping website...'}
+                  {processingStep === 'generating' && 'Scraping complete. Generating clean HTML...'}
+                </div>
+              )}
+
               {error && (
                 <div className="bg-destructive/20 border border-destructive/30 rounded-lg p-4 mb-6">
                   <p className="text-destructive-foreground">{error}</p>
@@ -196,40 +259,51 @@ export default function LandingPage() {
               )}
             </Card>
 
-            {html && (
+            {currentHtml && (
               <div className="space-y-6">
                 <Card className="p-6">
                   <div className="flex justify-between items-center mb-4">
-                    <h2 className="text-2xl font-bold">Cloned Website Preview</h2>
+                    <h2 className="text-2xl font-bold">
+                      {processingStep === 'complete' ? 'Generated HTML Preview' : 'Scraped HTML Preview'}
+                    </h2>
                     <Button onClick={downloadHtml} variant="secondary">
                       <Download className="w-4 h-4 mr-2" />
                       Download HTML
                     </Button>
                   </div>
 
-                  {/* Render the entire returned HTML inside an iframe */}
                   <div className="border rounded-lg overflow-hidden" style={{ height: '600px' }}>
                     <iframe
                       title="Cloned Preview"
-                      srcDoc={html}
+                      srcDoc={currentHtml}
                       className="w-full h-full"
                       sandbox="allow-scripts allow-same-origin"
                     />
                   </div>
+
+                  {rawHtml && generatedHtml && processingStep === 'complete' && (
+                    <div className="mt-4 text-center text-muted-foreground">
+                      Now showing generated HTML.
+                      <Button variant="link" onClick={() => setCurrentHtml(rawHtml)} className="p-0 ml-2">Show Raw HTML</Button>
+                    </div>
+                  )}
+                  {rawHtml && generatedHtml && currentHtml === rawHtml && (
+                    <div className="mt-4 text-center text-muted-foreground">
+                      Now showing raw HTML.
+                      <Button variant="link" onClick={() => setCurrentHtml(generatedHtml)} className="p-0 ml-2">Show Generated HTML</Button>
+                    </div>
+                  )}
                 </Card>
               </div>
             )}
-
           </div>
         </div>
       </div>
     )
   }
 
-  // Home page below (unchanged)
   return (
     <div className="min-h-screen bg-background">
-      {/* Navbar */}
       <nav className="border-b">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
           <div className="flex justify-between items-center h-16">
@@ -272,7 +346,6 @@ export default function LandingPage() {
           </div>
         </div>
 
-        {/* Mobile Menu */}
         {isMobileMenuOpen && (
           <div className="md:hidden border-t">
             <div className="px-2 pt-2 pb-3 space-y-1">
@@ -305,7 +378,6 @@ export default function LandingPage() {
         )}
       </nav>
 
-      {/* Sidebar - Quick Actions */}
       <div className="fixed left-4 top-1/2 transform -translate-y-1/2 z-40 hidden lg:block">
         <Card className="p-3">
           <div className="flex flex-col space-y-3">
@@ -322,7 +394,6 @@ export default function LandingPage() {
         </Card>
       </div>
 
-      {/* Hero Section */}
       <section className="pt-20 pb-32 px-4 sm:px-6 lg:px-8">
         <div className="max-w-7xl mx-auto text-center">
           <Badge className="mb-6">✨ AI-Powered Website Cloning</Badge>
@@ -351,7 +422,6 @@ export default function LandingPage() {
         </div>
       </section>
 
-      {/* Features Section */}
       <section id="features" className="py-20 px-4 sm:px-6 lg:px-8">
         <div className="max-w-7xl mx-auto">
           <div className="text-center mb-16">
@@ -373,7 +443,6 @@ export default function LandingPage() {
         </div>
       </section>
 
-      {/* Testimonials Section */}
       <section id="testimonials" className="py-20 px-4 sm:px-6 lg:px-8">
         <div className="max-w-7xl mx-auto">
           <div className="text-center mb-16">
@@ -407,7 +476,6 @@ export default function LandingPage() {
         </div>
       </section>
 
-      {/* Contact Section */}
       <section id="contact" className="py-20 px-4 sm:px-6 lg:px-8">
         <div className="max-w-4xl mx-auto">
           <div className="text-center mb-16">
@@ -451,7 +519,6 @@ export default function LandingPage() {
         </div>
       </section>
 
-      {/* Footer */}
       <footer className="border-t">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-12">
           <div className="grid grid-cols-1 md:grid-cols-4 gap-8">

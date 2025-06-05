@@ -9,4 +9,5 @@ python-dotenv
 playwright   
 groq
 google-genai         
+google-generativeai
        
