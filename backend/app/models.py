@@ -1,7 +1,7 @@
 # pydantic models for request and response bodies
 
 from pydantic import BaseModel, HttpUrl, field_validator
-from typing import Literal, List, Dict, Any # Import List, Dict, Any
+from typing import Literal, List, Dict, Any 
 import re
 
 
@@ -30,15 +30,8 @@ class CloneRequest(BaseModel):
         'mixtral-8x7b-32768'
     ] = 'gemini-2.5-pro-preview-05-06' # Default model
 
-    # Note: The URL validation is no longer relevant for this model as it takes a path
-
-
 class CloneResponse(BaseModel):
-    # This model might need adjustment based on what you actually return
     html: str  # the fully inlined, cloned HTML document
-    # You might want to add other fields returned by the endpoints
-    # raw_html: str | None = None # If /api/scrape also returns raw HTML
-    # generated_html: str | None = None # If /api/generate returns generated HTML
     raw_html_path: str | None = None
     generated_html_path: str | None = None
     debug_info: dict | None = None
@@ -53,7 +46,6 @@ class EditRequest(BaseModel):
     instruction: str # The editing instruction from the user
     model: Literal[
         'gemini-2.5-pro-preview-05-06',
-        # Add other editing models if needed, but prompt specified Gemini Pro
     ] = 'gemini-2.5-pro-preview-05-06' # Default/only model for editing
 
 class EditResponse(BaseModel):

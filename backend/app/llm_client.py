@@ -1,6 +1,4 @@
-# backend/app/llm_client.py
 # LLM + prompt template for the website cloner with CSS optimization
-# TO DO: Add support for other LLM providers
 
 import os, re
 import asyncio

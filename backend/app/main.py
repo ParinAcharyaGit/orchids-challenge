@@ -1,6 +1,6 @@
 import asyncio, os
 
-# ── On Windows, use ProactorEventLoopPolicy so subprocesses work ─────────────
+# ── On Windows, using ProactorEventLoopPolicy so subprocesses work ─────────────
 if os.name == "nt":
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
@@ -13,7 +13,8 @@ import time
 from pathlib import Path
 import hashlib
 from bs4 import BeautifulSoup
-import glob # Import glob to find files
+import glob 
+import re
 
 from models import CloneRequest, ScrapeRequest, EditRequest, EditResponse, LatestScrapedResponse
 from scraper_sync import fetch_design_context_sync
@@ -129,29 +130,17 @@ async def generate_website_endpoint(request: CloneRequest):
         if not raw_html_file.exists():
              raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Raw HTML file not found at {raw_html_path}")
 
-        # To pass data to generate_clone_html, we need the head, body, and css
-        # A more robust approach would save the full design_context from the scrape step
-        # or re-scrape (less efficient).
-        # Given the flow, let's reconstruct a minimal context
-        # by parsing the saved raw HTML file. CSS links/styles might be lost this way.
-        # If fetch_design_context_sync can work with local file paths or content, that's better.
-        # For now, let's read and parse to get head/body.
-
         with open(raw_html_file, "r", encoding="utf-8") as f:
              raw_full_html = f.read()
 
         soup = BeautifulSoup(raw_full_html, 'html.parser')
         # Reconstruct minimal design_context
-        # This might not include all original CSS, especially external stylesheets
         design_context_for_llm = {
             'head': str(soup.head) if soup.head else '',
             'body': str(soup.body) if soup.body else '',
-            'css': '', # Significant limitation here, might need re-scraping CSS or saving more data
-            'debug_info': {} # Start with empty debug info
+            'css': '',
+            'debug_info': {} 
         }
-
-        # You might want to re-run CSS scraping or pass the original CSS from /api/scrape
-        # For now, passing empty CSS might lead to unstyled generated HTML.
 
         llm_start = time.time()
         # Pass the reconstructed context and the model_id to the generation function
@@ -259,14 +248,9 @@ async def edit_html_endpoint(request: EditRequest):
 
 
         # 💾 Save edited HTML to disk
-        # Need a way to link edited file back to original scrape/generation.
-        # For simplicity, let's just append "_edited" and a timestamp.
         timestamp_str = time.strftime("%Y%m%d_%H%M%S", time.gmtime())
 
-        # Attempt to get the base filename from the raw_html_path if available,
-        # though this endpoint receives html_content directly.
-        # If you want to track edits of specific files, the request should ideally include the source file path.
-        # For now, let's create a new file named based on timestamp and a simple hash of the edited content or instruction
+        # Attempt to get the base filename from the raw_html_path if available
         instruction_hash = hashlib.md5(instruction.encode('utf-8')).hexdigest()[:8]
         filename = f"{timestamp_str}_edited_{instruction_hash}_{model_id.replace('-', '_')}.html"
         edited_html_path = CLONED_SITES_DIR / filename

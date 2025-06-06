@@ -45,7 +45,7 @@ export default function LandingPage() {
   const [currentHtml, setCurrentHtml] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string>('')
-  const [selectedModel, setSelectedModel] = useState('gemini-2.5-pro-preview-05-06')
+  const [selectedModel, setSelectedModel] = useState('gemini-2.5-pro-preview-05-06') // set as default due to large context window
   const [processingStep, setProcessingStep] = useState<'idle' | 'scraping' | 'generating' | 'complete' | 'error' | 'editing'>('idle')
 
   // --- Chat Panel State ---
@@ -110,7 +110,7 @@ export default function LandingPage() {
   const availableModels = [
     { id: 'llama-3.3-70b-versatile', name: 'Llama 3.3 70B Versatile (Groq)' },
     { id: 'gemini-2.5-pro-preview-05-06', name: 'Gemini 2.5 Pro' },
-    { id: 'mixtral-8x7b-32768', name: 'Mixtral 8x7B (128K Context, Groq)' }
+    { id: 'mixtral-8x7b-32768', name: 'Mixtral 8x7B (Groq)' }
   ]
 
   // --- Fetch latest scraped HTML path on page load or when clone is complete ---
